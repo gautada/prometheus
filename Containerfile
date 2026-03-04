@@ -1,56 +1,111 @@
-# ------------------------------------------------------------- [STAGE] INIT
-ARG ALPINE_TAG=3.14.1
-FROM alpine:$ALPINE_TAG as config-alpine
+ARG CONTAINER_VERSION=13.3
 
-RUN apk add --no-cache tzdata
+# ╭――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――╮
+# │ STAGE 1: Build Prometheus from source                                    │
+# ╰――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――╯
+FROM golang:1.23-bookworm AS builder
 
-RUN cp -v /usr/share/zoneinfo/America/New_York /etc/localtime
-RUN echo "America/New_York" > /etc/timezone
+# Install dependencies for building Prometheus and its UI.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    jq \
+    make \
+    nodejs \
+    npm \
+ && npm install -g yarn \
+ && rm -rf /var/lib/apt/lists/*
 
-# ------------------------------------------------------------- [STAGE] BUILD
-FROM alpine:$ALPINE_TAG as config-prometheus
+WORKDIR /build
 
-ARG BRANCH=v0.0.0
+# Resolve the latest Prometheus release tag and clone at that version.
+RUN IMAGE_VERSION=$(curl -sL "https://api.github.com/repos/prometheus/prometheus/releases/latest" \
+    | jq -r '.tag_name' \
+    | tr -d '[:space:]') \
+ && { [ -n "$IMAGE_VERSION" ] && [ "$IMAGE_VERSION" != "null" ] \
+      || { echo "ERROR: failed to resolve latest prometheus release from GitHub API" >&2; exit 1; }; } \
+ && echo "Building Prometheus ${IMAGE_VERSION}" \
+ && git config --global advice.detachedHead false \
+ && git clone --branch "${IMAGE_VERSION}" --depth 1 \
+              https://github.com/prometheus/prometheus.git .
 
-RUN apk add --no-cache bash build-base curl git go yarn
+# Build the Prometheus binaries and UI assets.
+RUN make assets \
+ && make build
 
-RUN git config --global advice.detachedHead false
+# ╭――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――╮
+# │ STAGE 2: Final container image                                           │
+# ╰――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――╯
+FROM docker.io/gautada/debian:${CONTAINER_VERSION} AS container
 
-RUN mkdir /usr/lib/go/src/github.com
-WORKDIR /usr/lib/go/src/github.com
-RUN git clone --branch $BRANCH --depth 1 https://github.com/prometheus/prometheus.git
-WORKDIR /usr/lib/go/src/github.com/prometheus
-RUN make assets
-RUN make build
+ARG IMAGE_NAME=prometheus
 
-WORKDIR /
+# ╭――――――――――――――――――――╮
+# │ METADATA           │
+# ╰――――――――――――――――――――╯
+LABEL org.opencontainers.image.title="${IMAGE_NAME}"
+LABEL org.opencontainers.image.description="A Prometheus monitoring container based on gautada/debian."
+LABEL org.opencontainers.image.url="https://hub.docker.com/r/gautada/${IMAGE_NAME}"
+LABEL org.opencontainers.image.source="https://github.com/gautada/${IMAGE_NAME}"
+LABEL org.opencontainers.image.license="Apache-2.0"
 
-# ----------------------------------------------------------- [STAGE] FINAL
-FROM alpine:$ALPINE_TAG
+# ╭――――――――――――――――――――╮
+# │ PACKAGES           │
+# ╰――――――――――――――――――――╯
+# hadolint ignore=DL3008
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends jq curl \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
 
-EXPOSE 9090
-
-COPY --from=config-alpine /etc/localtime /etc/localtime
-COPY --from=config-alpine /etc/timezone  /etc/timezone
-
-COPY --from=config-prometheus /usr/lib/go/src/github.com/prometheus/prometheus  /usr/bin/prometheus
-COPY --from=config-prometheus /usr/lib/go/src/github.com/prometheus/promtool  /usr/bin/promtool
-
-COPY config.yaml /etc/prometheus/config.yaml
-
-RUN mkdir -p /opt/prometheus-data
-
-RUN chmod 777 /opt/prometheus-data
-             
+# ╭――――――――――――――――――――╮
+# │ USER               │
+# ╰――――――――――――――――――――╯
 ARG USER=prometheus
-RUN addgroup $USER \
- && adduser -D -s /bin/sh -G $USER $USER \
- && echo "$USER:$USER" | chpasswd
- 
-USER $USER
-WORKDIR /home/prometheus
+RUN /usr/sbin/usermod -l $USER debian \
+ && /usr/sbin/usermod -d /home/$USER -m $USER \
+ && /usr/sbin/groupmod -n $USER debian \
+ && /bin/echo "$USER:$USER" | /usr/sbin/chpasswd
 
-RUN ln -s /opt/prometheus-data /home/prometheus/data
+# ╭――――――――――――――――――――╮
+# │ APPLICATION        │
+# ╰――――――――――――――――――――╯
+COPY --from=builder /build/prometheus /usr/bin/prometheus
+COPY --from=builder /build/promtool   /usr/bin/promtool
 
-ENTRYPOINT ["/usr/bin/prometheus"]
-CMD ["--config.file=/etc/prometheus/config.yaml"]
+# Configuration and persistence mapping.
+COPY config.yaml /etc/prometheus/config.yaml
+RUN mkdir -p /mnt/volumes/data/prometheus \
+ && chown -R $USER:$USER /mnt/volumes/data/prometheus
+
+# ╭――――――――――――――――――――╮
+# │ VERSION            │
+# ╰――――――――――――――――――――╯
+COPY version.sh /usr/bin/container-version
+RUN chmod +x /usr/bin/container-version
+
+# ╭――――――――――――――――――――╮
+# │ LATEST             │
+# ╰――――――――――――――――――――╯
+COPY latest.sh /usr/bin/container-latest
+RUN chmod +x /usr/bin/container-latest
+
+# ╭――――――――――――――――――――╮
+# │ HEALTH             │
+# ╰――――――――――――――――――――╯
+COPY appversion-check.sh /etc/container/health.d/appversion-check
+RUN chmod +x /etc/container/health.d/appversion-check
+COPY prometheus-running.sh /etc/container/health.d/prometheus-running
+RUN chmod +x /etc/container/health.d/prometheus-running
+
+# ╭――――――――――――――――――――╮
+# │ ENTRYPOINT         │
+# ╰――――――――――――――――――――╯
+COPY prometheus.s6 /etc/services.d/prometheus/run
+RUN chmod +x /etc/services.d/prometheus/run
+
+EXPOSE 9090/tcp
+VOLUME /mnt/volumes/data/prometheus
+
+WORKDIR /home/${USER}
