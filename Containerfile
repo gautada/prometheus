@@ -3,18 +3,17 @@ ARG CONTAINER_VERSION=13.3
 # ╭――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――╮
 # │ STAGE 1: Build Prometheus from source                                    │
 # ╰――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――╯
-FROM golang:1.23-bookworm AS builder
+FROM golang:1.25-trixie AS builder
 
 # Install dependencies for building Prometheus and its UI.
 RUN apt-get update \
+ && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends \
     git \
     curl bzip2 \
     jq \
     make \
     nodejs \
-    npm \
- && npm install -g yarn \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
