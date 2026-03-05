@@ -9,7 +9,7 @@ FROM golang:1.23-bookworm AS builder
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     git \
-    curl \
+    curl bzip2 \
     jq \
     make \
     nodejs \
